@@ -1,17 +1,20 @@
+# eval_compare.py — fixed evaluator (vectorized + obs shape safe)
+# Run: python eval_compare.py
+
 # ===== SILENCE WARNINGS & LOGS =====
 import os
 import warnings
 import numpy as np
-
-warnings.filterwarnings("ignore")  # Ignore all Python warnings
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress TensorFlow logs
-np.seterr(divide='ignore', invalid='ignore')  # Ignore divide-by-zero notices
+warnings.filterwarnings("ignore")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+np.seterr(divide='ignore', invalid='ignore')
 
 # ===== IMPORTS =====
 import glob
 import pandas as pd
 import matplotlib.pyplot as plt
 from stable_baselines3 import DQN
+from stable_baselines3.common.vec_env import DummyVecEnv
 from env_trading import TradingEnv
 from lstm_model import train_lstm_for_ticker, lstm_strategy_equity
 from arima_model import arima_strategy_equity
@@ -108,13 +111,37 @@ def save_dqn_plots(ticker, price_curve, positions, equity_curve):
     plt.savefig(os.path.join(RESULTS_DIR, f"{ticker}_DQN_price_trades.png"), dpi=150)
     plt.close()
 
+# Pad/truncate obs to expected model dimension
+def pad_or_truncate_obs(obs_arr, expected_dim):
+    obs = np.asarray(obs_arr)
+    if obs.ndim == 1:
+        obs = obs.reshape(1, -1)
+    n_env, curr_dim = obs.shape
+    if curr_dim == expected_dim:
+        return obs
+    elif curr_dim < expected_dim:
+        pad_width = expected_dim - curr_dim
+        pad = np.zeros((n_env, pad_width), dtype=obs.dtype)
+        # zeros appended on the right (features absent)
+        return np.concatenate([obs, pad], axis=1)
+    else:  # curr_dim > expected_dim
+        return obs[:, :expected_dim]
+
 # ========= MAIN =========
 if __name__ == "__main__":
     print("Using model:", MODEL_PATH)
     model = DQN.load(MODEL_PATH)
 
+    # expected dim from the loaded model/policy
+    obs_shape = model.policy.observation_space.shape
+    if len(obs_shape) != 1:
+        raise RuntimeError(f"Unexpected policy observation shape: {obs_shape}")
+    EXPECTED_DIM = int(obs_shape[0])
+    print(f"Model expects observation vector of length: {EXPECTED_DIM}")
+
     test_files = glob.glob(os.path.join(SPLIT_DIR, "*_test.csv"))
     tickers = [os.path.basename(f).replace("_test.csv", "") for f in test_files]
+    tickers.sort()
     print(f"Found {len(tickers)} tickers for evaluation: {tickers}")
 
     records = []
@@ -123,45 +150,85 @@ if __name__ == "__main__":
     inpos_all = 0
 
     for TICKER in tickers:
-        
-        env = TradingEnv(
-            ticker=TICKER,
-            split="test",
-            data_dir=SPLIT_DIR,
-            episode_length=10_000,
-            random_start=False
-        )
+        print(f"\n=== {TICKER} ===")
+        # Build a vectorized env so the model receives (n_env, obs_dim)
+        def make_env():
+            return TradingEnv(
+                ticker=TICKER,
+                split="test",
+                data_dir=SPLIT_DIR,
+                episode_length=10_000,
+                random_start=False
+            )
+        vec_env = DummyVecEnv([make_env])
 
-        obs, _ = env.reset()
-        done = False
+        # Reset (handle different reset signatures)
+        reset_ret = vec_env.reset()
+        if isinstance(reset_ret, tuple) and len(reset_ret) == 2:
+            obs_raw, _ = reset_ret
+        else:
+            obs_raw = reset_ret
 
-        dqn_equity = [env.equity]
-        dqn_price = [env._price(env.current_step)]
-        dqn_pos = [env.position]
+        obs = pad_or_truncate_obs(obs_raw, EXPECTED_DIM)
 
-        while not done:
+        dqn_equity = []
+        dqn_price = []
+        dqn_pos = []
+
+        step_count = 0
+        while True:
             action, _ = model.predict(obs, deterministic=DETERMINISTIC)
-            obs, reward, done, _, info = env.step(action)
-            dqn_equity.append(info["equity"])
-            dqn_price.append(info["price"])
-            dqn_pos.append(info["position"])
+            step_ret = vec_env.step(action)
 
+            # Normalize step returns (support 5-tuple and 4-tuple)
+            if len(step_ret) == 5:
+                obs_raw, rewards, terminateds, truncateds, infos = step_ret
+                dones = np.logical_or(terminateds, truncateds)
+            elif len(step_ret) == 4:
+                obs_raw, rewards, dones, infos = step_ret
+            else:
+                raise RuntimeError(f"Unexpected return from vec_env.step(): got {len(step_ret)} items")
+
+            obs = pad_or_truncate_obs(obs_raw, EXPECTED_DIM)
+
+            # index first (only) env
+            reward = rewards[0] if isinstance(rewards, (list, np.ndarray)) else rewards
+            done = dones[0] if isinstance(dones, (list, np.ndarray)) else dones
+            info = infos[0] if isinstance(infos, (list, np.ndarray)) else infos
+
+            dqn_equity.append(info.get("equity", np.nan))
+            dqn_price.append(info.get("price", np.nan))
+            dqn_pos.append(info.get("position", np.nan))
+
+            step_count += 1
+            if bool(done):
+                break
+            if step_count > 200_000:
+                warnings.warn("Step count exceeded 200k — breaking.")
+                break
+
+        vec_env.close()
+
+        # Convert arrays and compute metrics
         dqn_equity = np.array(dqn_equity, dtype=np.float64)
         dqn_price = np.array(dqn_price, dtype=np.float64)
         dqn_pos = np.array(dqn_pos, dtype=int)
 
         T = len(dqn_equity)
+        if T == 0:
+            print(f"No steps recorded for {TICKER} — skip.")
+            continue
         N = min(LAST_N_DAYS + 1, T)
         sl = slice(T - N, T)
 
         dqn_metrics = compute_metrics_from_equity(dqn_equity, dqn_pos, sl)
 
-        print(f"\n=== {TICKER} ===")
-        print(f"Trades: {dqn_metrics['TotalTrades']}, Wins: {dqn_metrics['WinRate']*100:.2f}%")
+        # Print summary
+        wr = dqn_metrics["WinRate"]
+        wr_str = f"{wr*100:.2f}%" if not np.isnan(wr) else "N/A"
+        print(f"Trades: {dqn_metrics['TotalTrades']}, Wins: {wr_str}")
         print(f"Cumulative return: {dqn_metrics['CumReturn']:.4f} ({dqn_metrics['CumReturn']*100:.2f}%)")
         print(f"Sharpe ratio: {dqn_metrics['Sharpe']:.2f}")
-
-
 
         total_trades_all += dqn_metrics["TotalTrades"]
         eq_window = dqn_equity[sl]
@@ -173,6 +240,7 @@ if __name__ == "__main__":
 
         save_dqn_plots(TICKER, dqn_price, dqn_pos, dqn_equity)
 
+        # LSTM evaluation (best-effort; keep your original behaviour)
         try:
             bundle = train_lstm_for_ticker(
                 split_dir=SPLIT_DIR,
@@ -191,6 +259,7 @@ if __name__ == "__main__":
             print(f"[LSTM] {TICKER} failed: {e}")
             lstm_metrics = {k: np.nan for k in ["CumReturn","AnnReturn","AnnVol","Sharpe","MaxDD","TotalTrades","WinRate"]}
 
+        # ARIMA evaluation
         try:
             df_train = _load_split(SPLIT_DIR, TICKER, "train")
             df_test  = _load_split(SPLIT_DIR, TICKER, "test")
@@ -227,6 +296,7 @@ if __name__ == "__main__":
             "ARIMA_WinRate": arima_metrics["WinRate"],
         })
 
+    # Save summary CSV
     summary_df = pd.DataFrame(records)
     out_csv = os.path.join(RESULTS_DIR, "compare_summary_last6w.csv")
     summary_df.to_csv(out_csv, index=False)
@@ -235,4 +305,7 @@ if __name__ == "__main__":
     win_rate_all = (wins_all / inpos_all) if inpos_all > 0 else float('nan')
     print(f"\n=== DQN Totals over last {LAST_N_DAYS} days across all tickers ===")
     print(f"Total trades: {total_trades_all}")
-    print(f"Total wins: {wins_all} / {inpos_all}  -> Win rate: {win_rate_all:.2%}")
+    if np.isnan(win_rate_all):
+        print("Win rate: N/A")
+    else:
+        print(f"Total wins: {wins_all} / {inpos_all}  -> Win rate: {win_rate_all:.2%}")

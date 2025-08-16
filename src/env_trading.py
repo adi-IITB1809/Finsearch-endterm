@@ -18,54 +18,37 @@ class TradingEnv(gym.Env):
         if split not in {"train", "val", "test"}:
             raise ValueError("split must be one of {'train','val','test'}")
 
-        filename = f"{ticker}_{split}.csv"
+        filename = f"{ticker}_{split}.csv"  # Example: RELIANCE_NS_train.csv
         self.file_path = os.path.join(data_dir, filename)
         if not os.path.isfile(self.file_path):
             raise FileNotFoundError(f"{self.file_path} not found. Please run 03_split_data.py first.")
 
+        # === Load CSV ===
         df = pd.read_csv(self.file_path)
         self.has_date = "Date" in df.columns
         if self.has_date:
             df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
-        # --- Identify price column ---
+        # === Force numeric conversion for all non-date columns ===
+        for col in df.columns:
+            if col != "Date":
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # === Identify price column ===
         price_candidates = ["Close", "Adj Close", "Adj_Close", "close", "adj_close"]
         self.price_col = next((c for c in price_candidates if c in df.columns), None)
         if self.price_col is None:
             raise ValueError("No price column found.")
 
-        # --- Force price to numeric ---
-        df[self.price_col] = (
-            df[self.price_col]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .str.replace("₹", "", regex=False)
-            .str.replace("--", "", regex=False)
-        )
-        df[self.price_col] = pd.to_numeric(df[self.price_col], errors="coerce")
-
-        # If price has NaNs, try filling from another available column
-        if df[self.price_col].isna().any():
-            for alt in ["Adj Close", "Adj_Close", "close", "adj_close"]:
-                if alt in df.columns and alt != self.price_col:
-                    alt_numeric = pd.to_numeric(
-                        df[alt].astype(str).str.replace(",", "", regex=False),
-                        errors="coerce"
-                    )
-                    df[self.price_col] = df[self.price_col].fillna(alt_numeric)
-
-        # Forward/backward fill any remaining NaNs
-        df[self.price_col] = df[self.price_col].ffill().bfill()
-
-        # Final safety check
-        if df[self.price_col].isna().any():
-            raise ValueError(f"Price column '{self.price_col}' still has NaNs after cleaning.")
-
         if self.has_date:
             df = df.sort_values("Date").reset_index(drop=True)
 
-        # --- Keep only numeric columns ---
+        # Keep numeric columns only
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if self.price_col not in numeric_cols:
+            raise ValueError(f"Price column '{self.price_col}' is not numeric after conversion.")
+
+        # Replace inf and NaN, forward/backward fill
         df = df[numeric_cols].replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna().reset_index(drop=True)
 
         self.df = df
@@ -76,7 +59,7 @@ class TradingEnv(gym.Env):
         self.numeric_cols = numeric_cols
         self.action_space = spaces.Discrete(3)
 
-        # Observation space: `history_len` previous steps
+        # Observation now includes `history_len` previous steps
         self.history_len = history_len
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
@@ -94,6 +77,7 @@ class TradingEnv(gym.Env):
     def _get_obs(self):
         start_idx = max(self.current_step - self.history_len + 1, 0)
         frames = self.df.iloc[start_idx:self.current_step+1][self.numeric_cols].values
+        # Pad if not enough history
         if len(frames) < self.history_len:
             pad = np.zeros((self.history_len - len(frames), len(self.numeric_cols)))
             frames = np.vstack((pad, frames))
@@ -137,11 +121,11 @@ class TradingEnv(gym.Env):
         ret = 0.0 if p0 == 0 else (p1 / p0) - 1.0
         reward = float(self.position) * ret
 
-        # Reward shaping
+        # Reward shaping to encourage active & correct trading
         if self.position == 0:
-            reward -= 0.0001
+            reward -= 0.0001  # penalty for staying flat
         if self.position == 1 and ret < 0:
-            reward -= 0.001
+            reward -= 0.001   # penalty for wrong long
 
         self.equity *= (1.0 + reward)
         self.current_step += 1

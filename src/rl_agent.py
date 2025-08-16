@@ -41,7 +41,7 @@ model = DQN(
     exploration_initial_eps=1.0,    # Start with full exploration
 )
 
-TOTAL_TIMESTEPS = 500000  # adjust for your hardware
+TOTAL_TIMESTEPS = 5000000  # adjust for your hardware
 
 print("Using CUDA device" if model.device.type == "cuda" else "Using CPU")
 model.learn(total_timesteps=TOTAL_TIMESTEPS)

@@ -1,0 +1,6 @@
+data/raw/
+data/processed/
+data/.yfinance_cache/
+.venv/
+__pycache__/
+*.py[cod]

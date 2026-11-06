@@ -1,50 +1,35 @@
-import os
+import os, json
 import pandas as pd
+from config import *
+from common import read_tickers, safe_name
 
-# Define paths
-ROOT_DIR = os.path.dirname(os.path.dirname(__file__))  # Finsearch/
-PROCESSED_DIR = os.path.join(ROOT_DIR, "data", "processed")
-SPLIT_DIR = os.path.join(ROOT_DIR, "data", "split")
-
-# Create split folder if it doesn't exist
-os.makedirs(SPLIT_DIR, exist_ok=True)
-
-def split_data(file_path, train_ratio=0.8, val_ratio=0.1):
-    """Split data into train, validation, and test CSV files."""
-    df = pd.read_csv(file_path)
-    total_len = len(df)
-
-    train_end = int(total_len * train_ratio)
-    val_end = int(total_len * (train_ratio + val_ratio))
-
-    df_train = df.iloc[:train_end]
-    df_val = df.iloc[train_end:val_end]
-    df_test = df.iloc[val_end:]
-
-    return df_train, df_val, df_test
 
 def main():
-    print(f"Looking for processed files in: {PROCESSED_DIR}")
-    files = [f for f in os.listdir(PROCESSED_DIR) if f.endswith("_state.csv")]
+    used, rows = [], []
+    for sym in read_tickers():
+        path = os.path.join(PROC_DIR, safe_name(sym) + ".csv")
+        if not os.path.exists(path):
+            continue
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        tr = df[df.index <= TRAIN_END]
+        va = df[(df.index > TRAIN_END) & (df.index <= VAL_END)]
+        te = df[df.index > VAL_END]
+        if len(tr) < MIN_TRAIN_ROWS or len(te) < MIN_TEST_ROWS:
+            print(f"  skip {sym}: train={len(tr)} test={len(te)}")
+            continue
+        mean = tr[FEATURES].mean()
+        std = tr[FEATURES].std().replace(0, 1.0).fillna(1.0)       # TRAIN-ONLY statistics
+        with open(os.path.join(SPLIT_DIR, safe_name(sym) + "_scaler.json"), "w") as f:
+            json.dump({"mean": mean.to_dict(), "std": std.to_dict()}, f)
+        used.append(sym)
+        rows.append(dict(Ticker=sym, Train=len(tr), Val=len(va), Test=len(te),
+                         First=df.index[0].date(), Last=df.index[-1].date()))
+    with open(os.path.join(SPLIT_DIR, "tickers_used.txt"), "w") as f:
+        f.write("\n".join(used))
+    pd.DataFrame(rows).to_csv(os.path.join(SPLIT_DIR, "split_summary.csv"), index=False)
+    print(f"\nSTOCKS USED: {len(used)}   <-- this is the number to put on your resume")
+    print(f"Train <= {TRAIN_END} | Val <= {VAL_END} | Test > {VAL_END}")
 
-    if not files:
-        print("❌ No processed files found. Please run 02_preprocessing.py first.")
-        return
-
-    for file_name in files:
-        # Remove "_state" so output filenames match what rl_agent.py expects
-        ticker = file_name.replace("_state.csv", "")
-        file_path = os.path.join(PROCESSED_DIR, file_name)
-
-        train_df, val_df, test_df = split_data(file_path)
-
-        train_df.to_csv(os.path.join(SPLIT_DIR, f"{ticker}_train.csv"), index=False)
-        val_df.to_csv(os.path.join(SPLIT_DIR, f"{ticker}_val.csv"), index=False)
-        test_df.to_csv(os.path.join(SPLIT_DIR, f"{ticker}_test.csv"), index=False)
-
-        print(f"✅ Split {ticker}: train {len(train_df)} rows, val {len(val_df)}, test {len(test_df)}")
-
-    print("\n🎯 Data splitting complete. Files saved in:", SPLIT_DIR)
 
 if __name__ == "__main__":
     main()

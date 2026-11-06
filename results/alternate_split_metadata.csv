@@ -1,0 +1,2 @@
+train_end,validation_end,test_start,test_end,stocks,dqn_steps,dqn_validation_sharpe,lstm_best_validation_loss
+2015-12-31,2016-12-31,2017-01-01,2019-06-28,43,40000,0.16059252976975696,0.9102820754051208

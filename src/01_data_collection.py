@@ -1,34 +1,23 @@
 import os
-import pandas as pd
-import yfinance as yf
+from config import *
+from common import read_tickers, download_prices, safe_name
 
-# Paths
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-RAW_DIR = os.path.join(DATA_DIR, "raw")
-TICKERS_FILE = os.path.join(DATA_DIR, "nifty50_tickers.txt")
-
-# Date range
-START_DATE = "2010-01-01"
-END_DATE = "2019-06-30"
 
 def main():
-    # Create raw folder if not exists
-    os.makedirs(RAW_DIR, exist_ok=True)
+    tickers = read_tickers()
+    print(f"Downloading {len(tickers)} tickers, {START_DATE} -> {END_DATE_EXCLUSIVE} (adjusted prices)")
+    ok, failed = 0, []
+    for t in tickers:
+        df = download_prices(t, START_DATE, END_DATE_EXCLUSIVE)
+        if df is None or len(df) < 100:
+            failed.append(t)
+            print("  FAILED/too short:", t)
+            continue
+        df.to_csv(os.path.join(RAW_DIR, safe_name(t) + ".csv"))
+        ok += 1
+        print(f"  {t}: {len(df)} rows ({df.index[0].date()} -> {df.index[-1].date()})")
+    print(f"\nSaved {ok} tickers. Failed: {failed}")
 
-    # Read tickers
-    with open(TICKERS_FILE, "r") as f:
-        tickers = [line.strip() for line in f if line.strip()]
-
-    print(f"Downloading {len(tickers)} NIFTY50 tickers from {START_DATE} to {END_DATE}...")
-
-    # Download all tickers
-    df = yf.download(tickers, start=START_DATE, end=END_DATE, group_by='ticker', auto_adjust=False)
-
-    # Save raw file
-    raw_path = os.path.join(RAW_DIR, "nifty50_2010_2019.csv")
-    df.to_csv(raw_path)
-    print(f"✅ Saved raw data to {raw_path}")
 
 if __name__ == "__main__":
     main()
